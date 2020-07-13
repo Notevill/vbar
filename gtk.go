@@ -56,6 +56,8 @@ import (
 	"sync"
 	"unsafe"
 
+	"fmt"
+
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
 )
@@ -69,9 +71,9 @@ type Rectangle struct {
 }
 
 func getMonitorDimensions(window *gtk.Window) (Rectangle, error) {
-	screen, err := window.GetScreen()
-	if err != nil {
-		return Rectangle{}, err
+	screen := window.GetScreen()
+	if screen == nil {
+		return Rectangle{}, fmt.Errorf("can't get screen")
 	}
 	display, err := screen.GetDisplay()
 	if err != nil {
@@ -130,9 +132,9 @@ func popupMenuAt(widget *gtk.Widget, menu *gtk.Menu) {
 }
 
 func enableTransparency(window *gtk.Window) error {
-	screen, err := window.GetScreen()
-	if err != nil {
-		return err
+	screen := window.GetScreen()
+	if screen == nil {
+		return fmt.Errorf("can't get screen")
 	}
 
 	visual, err := screen.GetRGBAVisual()
