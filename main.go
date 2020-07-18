@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
+	"net/rpc"
 	"os"
 	"os/exec"
 	"path"
@@ -56,17 +56,26 @@ var (
 	mutex  = &sync.Mutex{}
 )
 
+const (
+	socket = "/tmp/vbar_command"
+)
+
 func main() {
 	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
 	case commandStart.FullCommand():
 		launch()
 	case commandAddCSS.FullCommand():
-		sendCommand("add-css", AddCSS{
+		var res int
+		err := rpcClient().Call("Command.AddCSS", &AddCSS{
 			Class: *flagAddCSSClass,
 			Value: *flagAddCSSValue,
-		})
+		}, &res)
+		if err != nil || res < 0 {
+			log.Panicf("add-css err %v res %d", err, res)
+		}
 	case commandAddBlock.FullCommand():
-		sendCommand("add-block", AddBlock{
+		var res int
+		err := rpcClient().Call("Command.AddBlock", &AddBlock{
 			Name:         *flagAddBlockName,
 			Text:         *flagAddBlockText,
 			Left:         *flagAddBlockLeft,
@@ -76,21 +85,36 @@ func main() {
 			TailCommand:  *flagAddBlockTailCommand,
 			Interval:     *flagAddBlockInterval,
 			ClickCommand: *flagAddBlockClickCommand,
-		})
+		}, &res)
+		if err != nil || res < 0 {
+			log.Panicf("add-block err %v res %d", err, res)
+		}
 	case commandAddMenu.FullCommand():
-		sendCommand("add-menu", AddMenu{
+		var res int
+		err := rpcClient().Call("Command.AddMenu", &AddMenu{
 			Name:    *flagAddMenuBlockName,
 			Text:    *flagAddMenuText,
 			Command: *flagAddMenuCommand,
-		})
+		}, &res)
+		if err != nil || res < 0 {
+			log.Panicf("add-menu err %v res %d", err, res)
+		}
 	case commandUpdate.FullCommand():
-		sendCommand("update", Update{
+		var res int
+		err := rpcClient().Call("Command.Update", &Update{
 			Name: *flagUpdateBlockName,
-		})
+		}, &res)
+		if err != nil || res < 0 {
+			log.Panicf("update err %v res %d", err, res)
+		}
 	case commandRemove.FullCommand():
-		sendCommand("remove", Remove{
+		var res int
+		err := rpcClient().Call("Command.Remove", &Remove{
 			Name: *flagRemoveBlockName,
-		})
+		}, &res)
+		if err != nil || res < 0 {
+			log.Panicf("remove err %v res %d", err, res)
+		}
 	}
 }
 
@@ -103,7 +127,20 @@ func launch() {
 	}
 	window = w
 
-	go listenForCommands()
+	// create command listener
+	go func() {
+		server := rpc.NewServer()
+		_, errC := RegisterCommandControl(server, window)
+		if errC != nil {
+			log.Panicf("can't register rpc commands %v", errC)
+		}
+		listener, errL := net.Listen("unix", socket)
+		if errL != nil {
+			log.Panicf("can't create command listener %v", errL)
+		}
+		defer listener.Close()
+		server.Accept(listener)
+	}()
 
 	go func() {
 		err = executeConfig()
@@ -113,6 +150,15 @@ func launch() {
 	}()
 
 	gtk.Main()
+}
+
+func rpcClient() (client *rpc.Client) {
+	conn, errC := net.Dial("unix", socket)
+	if errC != nil {
+		log.Panicf("can't create command client %v", errC)
+	}
+	client = rpc.NewClient(conn)
+	return
 }
 
 func sendCommand(path string, command interface{}) {
@@ -159,94 +205,4 @@ func executeConfig() error {
 	}
 
 	return nil
-}
-
-func listenForCommands() {
-	writeResponse := func(w http.ResponseWriter, err error) {
-		serverResponse := ServerResponse{}
-		if err != nil {
-			serverResponse.Error = err.Error()
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		result, err := json.Marshal(serverResponse)
-		if err != nil {
-			log.Panic(err)
-		}
-		io.WriteString(w, string(result))
-	}
-
-	handler := func(c func(body []byte) error) http.HandlerFunc {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			body, err := ioutil.ReadAll(r.Body)
-			if err != nil {
-				writeResponse(w, err)
-				return
-			}
-			defer r.Body.Close()
-
-			mutex.Lock()
-			defer mutex.Unlock()
-			err = c(body)
-			if err != nil {
-				writeResponse(w, err)
-				return
-			}
-			writeResponse(w, nil)
-		})
-	}
-
-	http.HandleFunc("/add-css", handler(func(body []byte) error {
-		var command AddCSS
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addCSS(command)
-	}))
-
-	http.HandleFunc("/add-block", handler(func(body []byte) error {
-		var command AddBlock
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addBlock(command)
-	}))
-
-	http.HandleFunc("/add-menu", handler(func(body []byte) error {
-		var command AddMenu
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addMenu(command)
-	}))
-
-	http.HandleFunc("/update", handler(func(body []byte) error {
-		var command Update
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.updateBlock(command)
-	}))
-
-	http.HandleFunc("/remove", handler(func(body []byte) error {
-		var command Remove
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.removeBlock(command)
-	}))
-	err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
-	if err != nil {
-		log.Panic(err)
-	}
 }
