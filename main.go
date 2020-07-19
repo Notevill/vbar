@@ -1,16 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"log"
-	"net/http"
+	"net"
+	"net/rpc"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"sync"
 
@@ -22,9 +19,10 @@ import (
 var (
 	app = kingpin.New("vbar", "A bar.")
 
-	port = app.Flag("port", "Port to use for the command server.").Default("5643").OverrideDefaultFromEnvar("PORT").Int()
+	socketFile = app.Flag("socket", "Socket file to use for command server").Default("/tmp/vbar-command").String()
 
-	commandStart = app.Command("start", "Start vbar.")
+	commandStart   = app.Command("start", "Start vbar.")
+	flagStartForce = commandStart.Flag("force", "forces to start even if old instance not closed properly").Bool()
 
 	commandAddCSS   = app.Command("add-css", "Add CSS.")
 	flagAddCSSClass = commandAddCSS.Flag("class", "CSS Class name.").Required().String()
@@ -61,12 +59,15 @@ func main() {
 	case commandStart.FullCommand():
 		launch()
 	case commandAddCSS.FullCommand():
-		sendCommand("add-css", AddCSS{
+		err := rpcClient("Command.AddCSS", &AddCSS{
 			Class: *flagAddCSSClass,
 			Value: *flagAddCSSValue,
 		})
+		if err != nil {
+			log.Panicf("add-css err %v", err)
+		}
 	case commandAddBlock.FullCommand():
-		sendCommand("add-block", AddBlock{
+		err := rpcClient("Command.AddBlock", &AddBlock{
 			Name:         *flagAddBlockName,
 			Text:         *flagAddBlockText,
 			Left:         *flagAddBlockLeft,
@@ -77,20 +78,32 @@ func main() {
 			Interval:     *flagAddBlockInterval,
 			ClickCommand: *flagAddBlockClickCommand,
 		})
+		if err != nil {
+			log.Panicf("add-block err %v", err)
+		}
 	case commandAddMenu.FullCommand():
-		sendCommand("add-menu", AddMenu{
+		err := rpcClient("Command.AddMenu", &AddMenu{
 			Name:    *flagAddMenuBlockName,
 			Text:    *flagAddMenuText,
 			Command: *flagAddMenuCommand,
 		})
+		if err != nil {
+			log.Panicf("add-menu err %v", err)
+		}
 	case commandUpdate.FullCommand():
-		sendCommand("update", Update{
+		err := rpcClient("Command.Update", &Update{
 			Name: *flagUpdateBlockName,
 		})
+		if err != nil {
+			log.Panicf("update err %v", err)
+		}
 	case commandRemove.FullCommand():
-		sendCommand("remove", Remove{
+		err := rpcClient("Command.Remove", &Remove{
 			Name: *flagRemoveBlockName,
 		})
+		if err != nil {
+			log.Panicf("remove err %v", err)
+		}
 	}
 }
 
@@ -103,7 +116,26 @@ func launch() {
 	}
 	window = w
 
-	go listenForCommands()
+	var listener *net.Listener
+
+	// create command listener
+	go func() {
+		server := rpc.NewServer()
+		_, errC := RegisterCommandControl(server, window)
+		if errC != nil {
+			log.Panicf("can't register rpc commands %v", errC)
+		}
+		if *flagStartForce {
+			// remove old socket if it exists NOTE! old vbar instance need to close manualy
+			os.Remove(*socketFile)
+		}
+		listen, errL := net.Listen("unix", *socketFile)
+		if errL != nil {
+			log.Panicf("can't create command listener %v", errL)
+		}
+		listener = &listen
+		server.Accept(listen)
+	}()
 
 	go func() {
 		err = executeConfig()
@@ -112,34 +144,36 @@ func launch() {
 		}
 	}()
 
+	// add signal handler for proper close
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		// close listener socket
+		(*listener).Close()
+		// close qtk app
+		gtk.MainQuit()
+	}()
+
 	gtk.Main()
 }
 
-func sendCommand(path string, command interface{}) {
-	jsonValue, err := json.Marshal(command)
-	if err != nil {
-		log.Panic(err)
+func rpcClient(command string, args interface{}) (err error) {
+	conn, errC := net.Dial("unix", *socketFile)
+	if errC != nil {
+		log.Panicf("can't create command client %v", errC)
 	}
 
-	resp, err := http.Post(
-		fmt.Sprintf("http://localhost:%d/%s", *port, path),
-		"application/json",
-		bytes.NewBuffer(jsonValue),
-	)
-	if err != nil {
-		log.Panic(err)
-	}
-	defer resp.Body.Close()
+	client := rpc.NewClient(conn)
+	defer client.Close()
 
-	decoder := json.NewDecoder(resp.Body)
-	var serverResponse ServerResponse
-	err = decoder.Decode(&serverResponse)
-	if err != nil {
-		log.Fatal(err)
+	var res int
+	err = client.Call(command, args, &res)
+	if res != 0 {
+		err = fmt.Errorf("can't do command - error")
 	}
-	if serverResponse.Error != "" {
-		log.Fatal(errors.New(serverResponse.Error))
-	}
+
+	return
 }
 
 func executeConfig() error {
@@ -159,94 +193,4 @@ func executeConfig() error {
 	}
 
 	return nil
-}
-
-func listenForCommands() {
-	writeResponse := func(w http.ResponseWriter, err error) {
-		serverResponse := ServerResponse{}
-		if err != nil {
-			serverResponse.Error = err.Error()
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		result, err := json.Marshal(serverResponse)
-		if err != nil {
-			log.Panic(err)
-		}
-		io.WriteString(w, string(result))
-	}
-
-	handler := func(c func(body []byte) error) http.HandlerFunc {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			body, err := ioutil.ReadAll(r.Body)
-			if err != nil {
-				writeResponse(w, err)
-				return
-			}
-			defer r.Body.Close()
-
-			mutex.Lock()
-			defer mutex.Unlock()
-			err = c(body)
-			if err != nil {
-				writeResponse(w, err)
-				return
-			}
-			writeResponse(w, nil)
-		})
-	}
-
-	http.HandleFunc("/add-css", handler(func(body []byte) error {
-		var command AddCSS
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addCSS(command)
-	}))
-
-	http.HandleFunc("/add-block", handler(func(body []byte) error {
-		var command AddBlock
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addBlock(command)
-	}))
-
-	http.HandleFunc("/add-menu", handler(func(body []byte) error {
-		var command AddMenu
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.addMenu(command)
-	}))
-
-	http.HandleFunc("/update", handler(func(body []byte) error {
-		var command Update
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.updateBlock(command)
-	}))
-
-	http.HandleFunc("/remove", handler(func(body []byte) error {
-		var command Remove
-		err := json.Unmarshal(body, &command)
-		if err != nil {
-			return err
-		}
-
-		return window.removeBlock(command)
-	}))
-	err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
-	if err != nil {
-		log.Panic(err)
-	}
 }
