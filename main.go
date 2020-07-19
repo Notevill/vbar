@@ -1,16 +1,13 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"net/rpc"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"sync"
 
@@ -22,9 +19,10 @@ import (
 var (
 	app = kingpin.New("vbar", "A bar.")
 
-	port = app.Flag("port", "Port to use for the command server.").Default("5643").OverrideDefaultFromEnvar("PORT").Int()
+	socketFile = app.Flag("socket", "Socket file to use for command server").Default("/tmp/vbar-command").String()
 
-	commandStart = app.Command("start", "Start vbar.")
+	commandStart   = app.Command("start", "Start vbar.")
+	flagStartForce = commandStart.Flag("force", "forces to start even if old instance not closed properly").Bool()
 
 	commandAddCSS   = app.Command("add-css", "Add CSS.")
 	flagAddCSSClass = commandAddCSS.Flag("class", "CSS Class name.").Required().String()
@@ -56,26 +54,20 @@ var (
 	mutex  = &sync.Mutex{}
 )
 
-const (
-	socket = "/tmp/vbar_command"
-)
-
 func main() {
 	switch kingpin.MustParse(app.Parse(os.Args[1:])) {
 	case commandStart.FullCommand():
 		launch()
 	case commandAddCSS.FullCommand():
-		var res int
-		err := rpcClient().Call("Command.AddCSS", &AddCSS{
+		err := rpcClient("Command.AddCSS", &AddCSS{
 			Class: *flagAddCSSClass,
 			Value: *flagAddCSSValue,
-		}, &res)
-		if err != nil || res < 0 {
-			log.Panicf("add-css err %v res %d", err, res)
+		})
+		if err != nil {
+			log.Panicf("add-css err %v", err)
 		}
 	case commandAddBlock.FullCommand():
-		var res int
-		err := rpcClient().Call("Command.AddBlock", &AddBlock{
+		err := rpcClient("Command.AddBlock", &AddBlock{
 			Name:         *flagAddBlockName,
 			Text:         *flagAddBlockText,
 			Left:         *flagAddBlockLeft,
@@ -85,35 +77,32 @@ func main() {
 			TailCommand:  *flagAddBlockTailCommand,
 			Interval:     *flagAddBlockInterval,
 			ClickCommand: *flagAddBlockClickCommand,
-		}, &res)
-		if err != nil || res < 0 {
-			log.Panicf("add-block err %v res %d", err, res)
+		})
+		if err != nil {
+			log.Panicf("add-block err %v", err)
 		}
 	case commandAddMenu.FullCommand():
-		var res int
-		err := rpcClient().Call("Command.AddMenu", &AddMenu{
+		err := rpcClient("Command.AddMenu", &AddMenu{
 			Name:    *flagAddMenuBlockName,
 			Text:    *flagAddMenuText,
 			Command: *flagAddMenuCommand,
-		}, &res)
-		if err != nil || res < 0 {
-			log.Panicf("add-menu err %v res %d", err, res)
+		})
+		if err != nil {
+			log.Panicf("add-menu err %v", err)
 		}
 	case commandUpdate.FullCommand():
-		var res int
-		err := rpcClient().Call("Command.Update", &Update{
+		err := rpcClient("Command.Update", &Update{
 			Name: *flagUpdateBlockName,
-		}, &res)
-		if err != nil || res < 0 {
-			log.Panicf("update err %v res %d", err, res)
+		})
+		if err != nil {
+			log.Panicf("update err %v", err)
 		}
 	case commandRemove.FullCommand():
-		var res int
-		err := rpcClient().Call("Command.Remove", &Remove{
+		err := rpcClient("Command.Remove", &Remove{
 			Name: *flagRemoveBlockName,
-		}, &res)
-		if err != nil || res < 0 {
-			log.Panicf("remove err %v res %d", err, res)
+		})
+		if err != nil {
+			log.Panicf("remove err %v", err)
 		}
 	}
 }
@@ -127,6 +116,8 @@ func launch() {
 	}
 	window = w
 
+	var listener *net.Listener
+
 	// create command listener
 	go func() {
 		server := rpc.NewServer()
@@ -134,12 +125,16 @@ func launch() {
 		if errC != nil {
 			log.Panicf("can't register rpc commands %v", errC)
 		}
-		listener, errL := net.Listen("unix", socket)
+		if *flagStartForce {
+			// remove old socket if it exists NOTE! old vbar instance need to close manualy
+			os.Remove(*socketFile)
+		}
+		listen, errL := net.Listen("unix", *socketFile)
 		if errL != nil {
 			log.Panicf("can't create command listener %v", errL)
 		}
-		defer listener.Close()
-		server.Accept(listener)
+		listener = &listen
+		server.Accept(listen)
 	}()
 
 	go func() {
@@ -149,43 +144,36 @@ func launch() {
 		}
 	}()
 
+	// add signal handler for proper close
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt)
+		<-c
+		// close listener socket
+		(*listener).Close()
+		// close qtk app
+		gtk.MainQuit()
+	}()
+
 	gtk.Main()
 }
 
-func rpcClient() (client *rpc.Client) {
-	conn, errC := net.Dial("unix", socket)
+func rpcClient(command string, args interface{}) (err error) {
+	conn, errC := net.Dial("unix", *socketFile)
 	if errC != nil {
 		log.Panicf("can't create command client %v", errC)
 	}
-	client = rpc.NewClient(conn)
+
+	client := rpc.NewClient(conn)
+	defer client.Close()
+
+	var res int
+	err = client.Call(command, args, &res)
+	if res != 0 {
+		err = fmt.Errorf("can't do command - error")
+	}
+
 	return
-}
-
-func sendCommand(path string, command interface{}) {
-	jsonValue, err := json.Marshal(command)
-	if err != nil {
-		log.Panic(err)
-	}
-
-	resp, err := http.Post(
-		fmt.Sprintf("http://localhost:%d/%s", *port, path),
-		"application/json",
-		bytes.NewBuffer(jsonValue),
-	)
-	if err != nil {
-		log.Panic(err)
-	}
-	defer resp.Body.Close()
-
-	decoder := json.NewDecoder(resp.Body)
-	var serverResponse ServerResponse
-	err = decoder.Decode(&serverResponse)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if serverResponse.Error != "" {
-		log.Fatal(errors.New(serverResponse.Error))
-	}
 }
 
 func executeConfig() error {
