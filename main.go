@@ -10,19 +10,21 @@ import (
 	"os/signal"
 	"path"
 	"sync"
+	"syscall"
 
 	"github.com/cep21/xdgbasedir"
 	"github.com/gotk3/gotk3/gtk"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
+const (
+	socket = "/tmp/vbar-command"
+)
+
 var (
 	app = kingpin.New("vbar", "A bar.")
 
-	socketFile = app.Flag("socket", "Socket file to use for command server").Default("/tmp/vbar-command").String()
-
-	commandStart   = app.Command("start", "Start vbar.")
-	flagStartForce = commandStart.Flag("force", "forces to start even if old instance not closed properly").Bool()
+	commandStart = app.Command("start", "Start vbar.")
 
 	commandAddCSS   = app.Command("add-css", "Add CSS.")
 	flagAddCSSClass = commandAddCSS.Flag("class", "CSS Class name.").Required().String()
@@ -116,8 +118,7 @@ func launch() {
 	}
 	window = w
 
-	var listener *net.Listener
-
+	control := make(chan int)
 	// create command listener
 	go func() {
 		server := rpc.NewServer()
@@ -125,16 +126,17 @@ func launch() {
 		if errC != nil {
 			log.Panicf("can't register rpc commands %v", errC)
 		}
-		if *flagStartForce {
-			// remove old socket if it exists NOTE! old vbar instance need to close manualy
-			os.Remove(*socketFile)
-		}
-		listen, errL := net.Listen("unix", *socketFile)
+		// remove old socket if it exists NOTE! old vbar instance need to close manualy
+		os.Remove(socket)
+		listen, errL := net.Listen("unix", socket)
 		if errL != nil {
 			log.Panicf("can't create command listener %v", errL)
 		}
-		listener = &listen
-		server.Accept(listen)
+		defer listen.Close()
+		// satrt accepting on separate gorotine
+		go server.Accept(listen)
+		// and wait control signal to stop accepting
+		<-control
 	}()
 
 	go func() {
@@ -147,19 +149,20 @@ func launch() {
 	// add signal handler for proper close
 	go func() {
 		c := make(chan os.Signal, 1)
-		signal.Notify(c, os.Interrupt)
+
+		signal.Notify(c, os.Interrupt, syscall.SIGABRT)
 		<-c
-		// close listener socket
-		(*listener).Close()
+		// stops all gorotines wating control
+		close(control)
 		// close qtk app
-		gtk.MainQuit()
+		go gtk.MainQuit()
 	}()
 
 	gtk.Main()
 }
 
 func rpcClient(command string, args interface{}) (err error) {
-	conn, errC := net.Dial("unix", *socketFile)
+	conn, errC := net.Dial("unix", socket)
 	if errC != nil {
 		log.Panicf("can't create command client %v", errC)
 	}
