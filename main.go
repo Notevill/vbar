@@ -155,7 +155,7 @@ func launch() {
 		// stops all gorotines wating control
 		close(control)
 		// close qtk app
-		go gtk.MainQuit()
+		gtk.MainQuit()
 	}()
 
 	gtk.Main()
